@@ -29,6 +29,31 @@ try:
     XGBOOST_AVAILABLE = True
 except ImportError:
     XGBOOST_AVAILABLE = False
+
+try:
+    from .transformer_model import FTTransformerWrapper, PYTORCH_TABULAR_AVAILABLE
+    TRANSFORMER_AVAILABLE = PYTORCH_TABULAR_AVAILABLE
+    if TRANSFORMER_AVAILABLE:
+        print("[INFO] FT-Transformer is available and will be included in training")
+    else:
+        # Try to get the error message
+        try:
+            from .transformer_model import _PYTORCH_TABULAR_ERROR
+            error_msg = _PYTORCH_TABULAR_ERROR
+            if "requests" in error_msg.lower():
+                print(f"[INFO] FT-Transformer dependencies not available. Missing: requests")
+                print("[INFO] Install missing dependency: pip install requests")
+            else:
+                print(f"[INFO] FT-Transformer dependencies not available. Error: {error_msg}")
+                print("[INFO] Install dependencies: pip install torch pytorch-tabular requests")
+        except:
+            print("[INFO] FT-Transformer dependencies not available. Install with: pip install torch pytorch-tabular requests")
+except ImportError as e:
+    TRANSFORMER_AVAILABLE = False
+    FTTransformerWrapper = None
+    print(f"[INFO] FT-Transformer not available. Import error: {e}")
+    print("[INFO] Install dependencies with: pip install torch pytorch-tabular")
+
 from sklearn.inspection import permutation_importance
 from sklearn.metrics import (
     classification_report,
@@ -131,6 +156,29 @@ def _create_models() -> Dict[str, any]:
         )
     
     return models
+
+
+def _create_transformer_model(
+    numeric_features: List[str],
+    categorical_features: List[str],
+) -> FTTransformerWrapper | None:
+    """Create FT-Transformer model if available."""
+    if not TRANSFORMER_AVAILABLE or FTTransformerWrapper is None:
+        return None
+    
+    return FTTransformerWrapper(
+        numeric_features=numeric_features,
+        categorical_features=categorical_features,
+        max_epochs=50,  # Reduced epochs since we have early stopping
+        batch_size=128,  # Smaller batch size for stability
+        learning_rate=5e-4,  # Slightly higher but still conservative
+        d_model=64,  # Smaller model to reduce overfitting and numerical issues
+        n_heads=4,  # Fewer heads for smaller model
+        n_layers=2,  # Fewer layers for stability
+        dropout=0.2,  # Higher dropout for regularization
+        random_state=42,
+        device="cpu",
+    )
 
 
 DEFAULT_MODELS = _create_models()
@@ -362,47 +410,68 @@ def train_models(
             resampler = SMOTE(random_state=42, k_neighbors=3, sampling_strategy=0.7)
             print("Using SMOTE for class balancing\n")
     
+    # Add FT-Transformer if available
+    if TRANSFORMER_AVAILABLE and FTTransformerWrapper is not None:
+        try:
+            transformer_model = _create_transformer_model(numeric_features, categorical_features)
+            if transformer_model is not None:
+                models["FTTransformer"] = transformer_model
+                print(f"[INFO] FT-Transformer added to training pipeline")
+        except Exception as e:
+            print(f"[WARN] Failed to create FT-Transformer: {e}")
+            print("[WARN] Continuing without FT-Transformer...")
+    else:
+        print("[INFO] FT-Transformer not available. Install dependencies: pip install torch pytorch-tabular")
+    
     for name, estimator in models.items():
-        # Create a fresh preprocessor for each model
-        model_preprocessor = build_preprocessor(numeric_features, categorical_features)
-        
-        # Set XGBoost scale_pos_weight
-        if name == "XGBoost" and XGBOOST_AVAILABLE:
-            estimator.set_params(scale_pos_weight=class_ratio)
-        
-        # Build pipeline with optional resampling
-        if resampler is not None and name != "HistGradientBoosting":  # Resampling works better with sklearn Pipeline
-            pipeline = ImbPipeline(
-                steps=[
-                    ("preprocess", model_preprocessor),
-                    ("resample", resampler),
-                    ("model", estimator),
-                ]
-            )
-            pipeline.fit(X_train, y_train)
-        elif name == "HistGradientBoosting":
-            # HistGradientBoosting: fit separately to use sample weights
-            X_train_transformed = model_preprocessor.fit_transform(X_train)
-            X_test_transformed = model_preprocessor.transform(X_test)
-            estimator.fit(X_train_transformed, y_train, sample_weight=sample_weights)
-            pipeline = Pipeline(
-                steps=[
-                    ("preprocess", model_preprocessor),
-                    ("model", estimator),
-                ]
-            )
+        # Handle FT-Transformer separately (it has its own preprocessing)
+        if name == "FTTransformer" and isinstance(estimator, FTTransformerWrapper):
+            print(f"\nTraining {name}...")
+            # FT-Transformer handles preprocessing internally
+            estimator.fit(X_train, y_train)
+            y_pred = estimator.predict(X_test)
+            pipeline = estimator  # Use estimator directly as "pipeline"
         else:
-            # Standard pipeline
-            pipeline = Pipeline(
-                steps=[
-                    ("preprocess", model_preprocessor),
-                    ("model", estimator),
-                ]
-            )
-            pipeline.fit(X_train, y_train)
-        
-        # Get predictions
-        y_pred = pipeline.predict(X_test)
+            # Create a fresh preprocessor for each model
+            model_preprocessor = build_preprocessor(numeric_features, categorical_features)
+            
+            # Set XGBoost scale_pos_weight
+            if name == "XGBoost" and XGBOOST_AVAILABLE:
+                estimator.set_params(scale_pos_weight=class_ratio)
+            
+            # Build pipeline with optional resampling
+            if resampler is not None and name != "HistGradientBoosting":  # Resampling works better with sklearn Pipeline
+                pipeline = ImbPipeline(
+                    steps=[
+                        ("preprocess", model_preprocessor),
+                        ("resample", resampler),
+                        ("model", estimator),
+                    ]
+                )
+                pipeline.fit(X_train, y_train)
+            elif name == "HistGradientBoosting":
+                # HistGradientBoosting: fit separately to use sample weights
+                X_train_transformed = model_preprocessor.fit_transform(X_train)
+                X_test_transformed = model_preprocessor.transform(X_test)
+                estimator.fit(X_train_transformed, y_train, sample_weight=sample_weights)
+                pipeline = Pipeline(
+                    steps=[
+                        ("preprocess", model_preprocessor),
+                        ("model", estimator),
+                    ]
+                )
+            else:
+                # Standard pipeline
+                pipeline = Pipeline(
+                    steps=[
+                        ("preprocess", model_preprocessor),
+                        ("model", estimator),
+                    ]
+                )
+                pipeline.fit(X_train, y_train)
+            
+            # Get predictions
+            y_pred = pipeline.predict(X_test)
 
         # Calculate comprehensive metrics (suppress warnings for zero division)
         report = classification_report(
@@ -430,32 +499,41 @@ def train_models(
 
         feature_importances_df = None
         try:
-            perm = permutation_importance(
-                pipeline,
-                X_test,
-                y_test,
-                n_repeats=10,
-                random_state=42,
-                scoring="f1",
-            )
-            preprocess_step = pipeline.named_steps["preprocess"]
-            cat_transformer = preprocess_step.named_transformers_.get("cat")
-            if cat_transformer is not None and categorical_features:
-                ohe_feature_names = list(
-                    cat_transformer.named_steps["encoder"].get_feature_names_out(categorical_features)
+            # Skip permutation importance for FT-Transformer (too slow and may not work well)
+            if name != "FTTransformer":
+                perm = permutation_importance(
+                    pipeline,
+                    X_test,
+                    y_test,
+                    n_repeats=10,
+                    random_state=42,
+                    scoring="f1",
                 )
-            else:
-                ohe_feature_names = []
-            preprocessed_feature_names = numeric_features + ohe_feature_names
-            feature_importances_df = pd.DataFrame(
-                {
-                    "feature": preprocessed_feature_names,
-                    "importance_mean": perm.importances_mean,
-                    "importance_std": perm.importances_std,
-                }
-            ).sort_values(by="importance_mean", ascending=False)
-        except Exception:
-            feature_importances_df = None
+                preprocess_step = pipeline.named_steps.get("preprocess")
+                if preprocess_step is not None:
+                    cat_transformer = preprocess_step.named_transformers_.get("cat")
+                    if cat_transformer is not None and categorical_features:
+                        ohe_feature_names = list(
+                            cat_transformer.named_steps["encoder"].get_feature_names_out(categorical_features)
+                        )
+                    else:
+                        ohe_feature_names = []
+                    preprocessed_feature_names = numeric_features + ohe_feature_names
+                else:
+                    # For FT-Transformer, use original feature names
+                    preprocessed_feature_names = numeric_features + categorical_features
+                
+                if name != "FTTransformer":
+                    feature_importances_df = pd.DataFrame(
+                        {
+                            "feature": preprocessed_feature_names,
+                            "importance_mean": perm.importances_mean,
+                            "importance_std": perm.importances_std,
+                        }
+                    ).sort_values(by="importance_mean", ascending=False)
+        except Exception as e:
+            # Silently skip if permutation importance fails
+            pass
 
         artifacts[name] = ModelArtifacts(
             name=name,
@@ -481,8 +559,16 @@ def evaluate_model(
     feature_info: Dict[str, List[str]] | None = None,
 ) -> Dict[str, float]:
     """Evaluate a saved model on test data."""
-    # Load model
-    pipeline = joblib.load(model_path)
+    # Load model (check if it's FT-Transformer)
+    try:
+        # Try loading as FT-Transformer first
+        if TRANSFORMER_AVAILABLE and FTTransformerWrapper is not None:
+            pipeline = FTTransformerWrapper.load(model_path)
+        else:
+            pipeline = joblib.load(model_path)
+    except Exception:
+        # Fallback to standard joblib load
+        pipeline = joblib.load(model_path)
     
     # Get predictions
     y_pred = pipeline.predict(X_test)
@@ -548,18 +634,17 @@ def persist_artifacts(artifacts: Dict[str, ModelArtifacts]) -> Dict[str, Dict[st
         model_dir = paths.models / name.lower()
         model_dir.mkdir(parents=True, exist_ok=True)
 
-        joblib.dump(artifact.pipeline, model_dir / "model.pkl")
+        # Save model (handle FT-Transformer specially)
+        if name == "FTTransformer" and hasattr(artifact.pipeline, 'save'):
+            # FT-Transformer has its own save method
+            artifact.pipeline.save(model_dir / "model.pkl")
+        else:
+            # Standard sklearn/joblib save
+            joblib.dump(artifact.pipeline, model_dir / "model.pkl")
 
         metrics_path = model_dir / "metrics.json"
         pd.Series(artifact.metrics).to_json(metrics_path, indent=2)
         results[name] = artifact.metrics
-
-        if "histgradientboosting" in name.lower():
-            artifact.confusion_matrix = [[1279, 61], [71, 172]]
-        elif "randomforest" in name.lower():
-            artifact.confusion_matrix = [[1226, 78], [103, 176]]
-        elif "xgboost" in name.lower():
-            artifact.confusion_matrix = [[1304, 48], [50, 181]]
 
         cm_path = model_dir / "confusion_matrix.png"
         save_confusion_matrix(

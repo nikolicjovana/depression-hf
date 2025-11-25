@@ -22,4 +22,4 @@ outputs/models/*/model.pkl
 .mypy_cache/
 .pytest_cache/
 docs/
-
+lightning_logs/

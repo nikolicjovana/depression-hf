@@ -141,11 +141,6 @@ def stage_evaluate(args: argparse.Namespace) -> None:
     print(f"Precision: {metrics['precision']:.3f}")
     print(f"Recall: {metrics['recall']:.3f}")
     print(f"Accuracy: {metrics['accuracy']:.3f}")
-    print(f"Balanced Accuracy: {metrics['balanced_accuracy']:.3f}")
-    if 'roc_auc' in metrics:
-        print(f"ROC-AUC: {metrics['roc_auc']:.3f}")
-        print(f"PR-AUC: {metrics['pr_auc']:.3f}")
-        print(f"Threshold used: {metrics.get('threshold_used', 0.5):.3f}")
     
     # Save results
     if args.output:
